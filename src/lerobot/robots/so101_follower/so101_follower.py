@@ -59,6 +59,8 @@ class SO101Follower(Robot):
             calibration=self.calibration,
         )
         self.cameras = make_cameras_from_configs(config.cameras)
+        # Cache for last successful camera frames
+        self._last_camera_frames: dict[str, Any] = {}
 
     @property
     def _motors_ft(self) -> dict[str, type]:
@@ -66,9 +68,14 @@ class SO101Follower(Robot):
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
-        return {
-            cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras
-        }
+        features = {}
+        for cam_key, cam_config in self.config.cameras.items():
+            # Add color image
+            features[cam_key] = (cam_config.height, cam_config.width, 3)
+            # Add depth image if enabled
+            if hasattr(cam_config, 'use_depth') and cam_config.use_depth:
+                features[f"{cam_key}.depth"] = (cam_config.height, cam_config.width)
+        return features
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
@@ -152,10 +159,10 @@ class SO101Follower(Robot):
             for motor in self.bus.motors:
                 self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
                 # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
-                self.bus.write("P_Coefficient", motor, 16)
+                self.bus.write("P_Coefficient", motor, 8) # default 16
                 # Set I_Coefficient and D_Coefficient to default value 0 and 32
-                self.bus.write("I_Coefficient", motor, 0)
-                self.bus.write("D_Coefficient", motor, 32)
+                self.bus.write("I_Coefficient", motor, 8) # default 0
+                self.bus.write("D_Coefficient", motor, 16) # default 32
 
                 if motor == "gripper":
                     self.bus.write(
@@ -183,10 +190,38 @@ class SO101Follower(Robot):
 
         # Capture images from cameras
         for cam_key, cam in self.cameras.items():
-            start = time.perf_counter()
-            obs_dict[cam_key] = cam.async_read()
-            dt_ms = (time.perf_counter() - start) * 1e3
-            logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
+            cam_config = self.config.cameras[cam_key]
+
+            # For cameras with depth, use synchronized read to avoid frameset conflicts
+            if hasattr(cam_config, 'use_depth') and cam_config.use_depth and hasattr(cam, 'read_color_and_depth'):
+                try:
+                    # Read color and depth from the same frameset
+                    start = time.perf_counter()
+                    color_img, depth_img = cam.read_color_and_depth()
+                    dt_ms = (time.perf_counter() - start) * 1e3
+                    logger.debug(f"{self} read {cam_key} (color+depth): {dt_ms:.1f}ms")
+
+                    obs_dict[cam_key] = color_img
+                    if depth_img is not None:
+                        obs_dict[f"{cam_key}.depth"] = depth_img
+
+                    # Cache successful frames
+                    self._last_camera_frames[cam_key] = color_img
+                    if depth_img is not None:
+                        self._last_camera_frames[f"{cam_key}.depth"] = depth_img
+                except Exception as e:
+                    logger.warning(f"Failed to read from {cam_key}: {e}")
+                    # Use cached frames if available
+                    if cam_key in self._last_camera_frames:
+                        obs_dict[cam_key] = self._last_camera_frames[cam_key]
+                        if f"{cam_key}.depth" in self._last_camera_frames:
+                            obs_dict[f"{cam_key}.depth"] = self._last_camera_frames[f"{cam_key}.depth"]
+            else:
+                # Use async read for other cameras
+                start = time.perf_counter()
+                obs_dict[cam_key] = cam.async_read()
+                dt_ms = (time.perf_counter() - start) * 1e3
+                logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
         return obs_dict
 
