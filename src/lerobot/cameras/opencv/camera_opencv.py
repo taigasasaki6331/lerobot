@@ -298,44 +298,85 @@ class OpenCVCamera(Camera):
             where each dictionary contains 'type', 'id' (port index or path),
             and the default profile properties (width, height, fps, format).
         """
+        import subprocess
+        import signal
+
         found_cameras_info = []
 
         targets_to_scan: list[str | int]
         if platform.system() == "Linux":
             possible_paths = sorted(Path("/dev").glob("video*"), key=lambda p: p.name)
-            targets_to_scan = [str(p) for p in possible_paths]
+
+            # Filter out problematic devices on Jetson platforms (e.g., Gemini vi-output devices)
+            # Use v4l2-ctl to identify devices that may cause hangs
+            filtered_paths = []
+            for p in possible_paths:
+                try:
+                    result = subprocess.run(
+                        ["v4l2-ctl", "-d", str(p), "--info"],
+                        capture_output=True,
+                        text=True,
+                        timeout=1
+                    )
+                    # Skip devices with "vi-output" or "tegra-capture" in driver name (Jetson MIPI/CSI cameras)
+                    if "vi-output" not in result.stdout and "tegra-capture" not in result.stdout:
+                        filtered_paths.append(p)
+                    else:
+                        logger.info(f"Skipping {p} (Jetson MIPI/CSI device, use Gemini camera interface instead)")
+                except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.CalledProcessError):
+                    # If v4l2-ctl is not available or times out, include the device
+                    filtered_paths.append(p)
+
+            targets_to_scan = [str(p) for p in filtered_paths]
         else:
             targets_to_scan = [int(i) for i in range(MAX_OPENCV_INDEX)]
 
         for target in targets_to_scan:
-            camera = cv2.VideoCapture(target)
-            if camera.isOpened():
-                default_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-                default_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                default_fps = camera.get(cv2.CAP_PROP_FPS)
-                default_format = camera.get(cv2.CAP_PROP_FORMAT)
+            try:
+                # Use a signal-based timeout to prevent hanging on problematic devices
+                def timeout_handler(signum, frame):
+                    raise TimeoutError(f"Timeout opening camera {target}")
 
-                # Get FOURCC code and convert to string
-                default_fourcc_code = camera.get(cv2.CAP_PROP_FOURCC)
-                default_fourcc_code_int = int(default_fourcc_code)
-                default_fourcc = "".join([chr((default_fourcc_code_int >> 8 * i) & 0xFF) for i in range(4)])
+                old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(2)  # 2 second timeout
 
-                camera_info = {
-                    "name": f"OpenCV Camera @ {target}",
-                    "type": "OpenCV",
-                    "id": target,
-                    "backend_api": camera.getBackendName(),
-                    "default_stream_profile": {
-                        "format": default_format,
-                        "fourcc": default_fourcc,
-                        "width": default_width,
-                        "height": default_height,
-                        "fps": default_fps,
-                    },
-                }
+                try:
+                    camera = cv2.VideoCapture(target)
+                    if camera.isOpened():
+                        default_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        default_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        default_fps = camera.get(cv2.CAP_PROP_FPS)
+                        default_format = camera.get(cv2.CAP_PROP_FORMAT)
 
-                found_cameras_info.append(camera_info)
-                camera.release()
+                        # Get FOURCC code and convert to string
+                        default_fourcc_code = camera.get(cv2.CAP_PROP_FOURCC)
+                        default_fourcc_code_int = int(default_fourcc_code)
+                        default_fourcc = "".join([chr((default_fourcc_code_int >> 8 * i) & 0xFF) for i in range(4)])
+
+                        camera_info = {
+                            "name": f"OpenCV Camera @ {target}",
+                            "type": "OpenCV",
+                            "id": target,
+                            "backend_api": camera.getBackendName(),
+                            "default_stream_profile": {
+                                "format": default_format,
+                                "fourcc": default_fourcc,
+                                "width": default_width,
+                                "height": default_height,
+                                "fps": default_fps,
+                            },
+                        }
+
+                        found_cameras_info.append(camera_info)
+                        camera.release()
+                finally:
+                    signal.alarm(0)
+                    signal.signal(signal.SIGALRM, old_handler)
+
+            except TimeoutError:
+                logger.warning(f"Skipping {target}: device timed out (may be incompatible)")
+            except Exception as e:
+                logger.debug(f"Skipping {target}: {e}")
 
         return found_cameras_info
 
